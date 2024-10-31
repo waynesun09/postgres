@@ -49,6 +49,22 @@ RUN set -eux; \
 	gosu --version; \
 	gosu nobody true
 
+ENV PG_MAJOR 17
+ENV PGDATA /var/lib/postgresql/data
+ENV PATH $PATH:/usr/lib/postgresql/$PG_MAJOR/bin
+
+# this 1777 will be replaced by 0700 at runtime (allows semi-arbitrary "--user" values)
+RUN install --verbose --directory --owner postgres --group postgres --mode 1777 "$PGDATA"
+VOLUME /var/lib/postgresql/data
+
+RUN apt-get update; apt-get install -y wget lsb-release curl; \
+        wget -O ./percona-release_latest.generic_all.deb https://repo.percona.com/apt/percona-release_latest.generic_all.deb; \
+        apt-get install -y ./percona-release_latest.generic_all.deb; \
+        percona-release setup ppg-17; \
+        apt-get install -y percona-pg-stat-monitor17 "postgresql-$PG_MAJOR-pgaudit"; \
+        cp -r /var/lib/postgresql/$PG_MAJOR/main/* "$PGDATA"
+
+
 # make the "en_US.UTF-8" locale so postgres will be utf-8 enabled by default
 RUN set -eux; \
 	if [ -f /etc/dpkg/dpkg.cfg.d/docker ]; then \
@@ -86,91 +102,6 @@ RUN set -ex; \
 	gpgconf --kill all; \
 	rm -rf "$GNUPGHOME"
 
-ENV PG_MAJOR 17
-ENV PATH $PATH:/usr/lib/postgresql/$PG_MAJOR/bin
-
-ENV PG_VERSION 17.0-1.pgdg120+1
-
-RUN set -ex; \
-	\
-# see note below about "*.pyc" files
-	export PYTHONDONTWRITEBYTECODE=1; \
-	\
-	dpkgArch="$(dpkg --print-architecture)"; \
-	aptRepo="[ signed-by=/usr/local/share/keyrings/postgres.gpg.asc ] http://apt.postgresql.org/pub/repos/apt/ bookworm-pgdg main $PG_MAJOR"; \
-	case "$dpkgArch" in \
-		amd64 | arm64 | ppc64el | s390x) \
-# arches officialy built by upstream
-			echo "deb $aptRepo" > /etc/apt/sources.list.d/pgdg.list; \
-			apt-get update; \
-			;; \
-		*) \
-# we're on an architecture upstream doesn't officially build for
-# let's build binaries from their published source packages
-			echo "deb-src $aptRepo" > /etc/apt/sources.list.d/pgdg.list; \
-			\
-			savedAptMark="$(apt-mark showmanual)"; \
-			\
-			tempDir="$(mktemp -d)"; \
-			cd "$tempDir"; \
-			\
-# create a temporary local APT repo to install from (so that dependency resolution can be handled by APT, as it should be)
-			apt-get update; \
-			apt-get install -y --no-install-recommends dpkg-dev; \
-			echo "deb [ trusted=yes ] file://$tempDir ./" > /etc/apt/sources.list.d/temp.list; \
-			_update_repo() { \
-				dpkg-scanpackages . > Packages; \
-# work around the following APT issue by using "Acquire::GzipIndexes=false" (overriding "/etc/apt/apt.conf.d/docker-gzip-indexes")
-#   Could not open file /var/lib/apt/lists/partial/_tmp_tmp.ODWljpQfkE_._Packages - open (13: Permission denied)
-#   ...
-#   E: Failed to fetch store:/var/lib/apt/lists/partial/_tmp_tmp.ODWljpQfkE_._Packages  Could not open file /var/lib/apt/lists/partial/_tmp_tmp.ODWljpQfkE_._Packages - open (13: Permission denied)
-				apt-get -o Acquire::GzipIndexes=false update; \
-			}; \
-			_update_repo; \
-			\
-# build .deb files from upstream's source packages (which are verified by apt-get)
-			nproc="$(nproc)"; \
-			export DEB_BUILD_OPTIONS="nocheck parallel=$nproc"; \
-# we have to build postgresql-common first because postgresql-$PG_MAJOR shares "debian/rules" logic with it: https://salsa.debian.org/postgresql/postgresql/-/commit/99f44476e258cae6bf9e919219fa2c5414fa2876
-# (and it "Depends: pgdg-keyring")
-			apt-get build-dep -y postgresql-common pgdg-keyring; \
-			apt-get source --compile postgresql-common pgdg-keyring; \
-			_update_repo; \
-			apt-get build-dep -y "postgresql-$PG_MAJOR=$PG_VERSION"; \
-			apt-get source --compile "postgresql-$PG_MAJOR=$PG_VERSION"; \
-			\
-# we don't remove APT lists here because they get re-downloaded and removed later
-			\
-# reset apt-mark's "manual" list so that "purge --auto-remove" will remove all build dependencies
-# (which is done after we install the built packages so we don't have to redownload any overlapping dependencies)
-			apt-mark showmanual | xargs apt-mark auto > /dev/null; \
-			apt-mark manual $savedAptMark; \
-			\
-			ls -lAFh; \
-			_update_repo; \
-			grep '^Package: ' Packages; \
-			cd /; \
-			;; \
-	esac; \
-	\
-	apt-get install -y --no-install-recommends postgresql-common; \
-	sed -ri 's/#(create_main_cluster) .*$/\1 = false/' /etc/postgresql-common/createcluster.conf; \
-	apt-get install -y --no-install-recommends \
-		"postgresql-$PG_MAJOR=$PG_VERSION" \
-	; \
-	\
-	rm -rf /var/lib/apt/lists/*; \
-	\
-	if [ -n "$tempDir" ]; then \
-# if we have leftovers from building, let's purge them (including extra, unnecessary build deps)
-		apt-get purge -y --auto-remove; \
-		rm -rf "$tempDir" /etc/apt/sources.list.d/temp.list; \
-	fi; \
-	\
-# some of the steps above generate a lot of "*.pyc" files (and setting "PYTHONDONTWRITEBYTECODE" beforehand doesn't propagate properly for some reason), so we clean them up manually (as long as they aren't owned by a package)
-	find /usr -name '*.pyc' -type f -exec bash -c 'for pyc; do dpkg -S "$pyc" &> /dev/null || rm -vf "$pyc"; done' -- '{}' +; \
-	\
-	postgres --version
 
 # make the sample config easier to munge (and "correct by default")
 RUN set -eux; \
@@ -178,14 +109,8 @@ RUN set -eux; \
 	cp -v /usr/share/postgresql/postgresql.conf.sample.dpkg /usr/share/postgresql/postgresql.conf.sample; \
 	ln -sv ../postgresql.conf.sample "/usr/share/postgresql/$PG_MAJOR/"; \
 	sed -ri "s!^#?(listen_addresses)\s*=\s*\S+.*!\1 = '*'!" /usr/share/postgresql/postgresql.conf.sample; \
-	grep -F "listen_addresses = '*'" /usr/share/postgresql/postgresql.conf.sample
-
-RUN install --verbose --directory --owner postgres --group postgres --mode 3777 /var/run/postgresql
-
-ENV PGDATA /var/lib/postgresql/data
-# this 1777 will be replaced by 0700 at runtime (allows semi-arbitrary "--user" values)
-RUN install --verbose --directory --owner postgres --group postgres --mode 1777 "$PGDATA"
-VOLUME /var/lib/postgresql/data
+	grep -F "listen_addresses = '*'" /usr/share/postgresql/postgresql.conf.sample; \
+        echo "shared_preload_libraries = 'pg_stat_monitor,pgaudit'" >>/usr/share/postgresql/postgresql.conf.sample
 
 COPY docker-entrypoint.sh docker-ensure-initdb.sh /usr/local/bin/
 RUN ln -sT docker-ensure-initdb.sh /usr/local/bin/docker-enforce-initdb.sh
