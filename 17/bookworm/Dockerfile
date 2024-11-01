@@ -172,6 +172,15 @@ RUN set -ex; \
 	\
 	postgres --version
 
+# Install pg_stat_monitor and pgaudit
+RUN apt-get update; \
+         apt-get install -y "postgresql-$PG_MAJOR-pgaudit" build-essential make curl git postgresql-contrib libpq-dev "postgresql-server-dev-$PG_MAJOR"; \
+         git clone https://github.com/percona/pg_stat_monitor.git; \
+         cd pg_stat_monitor; \
+         make USE_PGXS=1; \
+         make USE_PGXS=1 install; \
+         apt-get purge build-essential make curl git postgresql-contrib libpq-dev "postgresql-server-dev-$PG_MAJOR" -y --auto-remove
+
 # make the sample config easier to munge (and "correct by default")
 RUN set -eux; \
 	dpkg-divert --add --rename --divert "/usr/share/postgresql/postgresql.conf.sample.dpkg" "/usr/share/postgresql/$PG_MAJOR/postgresql.conf.sample"; \
